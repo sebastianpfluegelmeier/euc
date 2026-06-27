@@ -7,7 +7,7 @@
     if (n <= 0) return [];
     const p: boolean[] = new Array(n);
     for (let i = 0; i < n; i++) {
-      p[i] = Math.floor(((i + 1) * k) / n) > Math.floor((i * k) / n);
+      p[i] = Math.floor((i * k) / n) > Math.floor(((i - 1) * k) / n);
     }
     return p;
   }
