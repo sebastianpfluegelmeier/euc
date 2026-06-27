@@ -513,10 +513,12 @@
   }
 
   /* ── A stage = one processor block followed by its result viz ── */
+  /* Fixed height = 16 step dots tall (16*7px + 15*2px gap) + 5px*2 padding. */
   .flow-stage {
     flex-shrink: 0;
     display: flex;
-    align-items: flex-start;
+    align-items: stretch;
+    height: 152px;
     border-top: 2px solid #333;
   }
 
@@ -577,13 +579,14 @@
     margin-bottom: 5px;
   }
 
-  /* ── Viz (vertical column of step dots) ── */
+  /* ── Viz: vertical dots, max 16 tall, then wraps into the next column ── */
   .euc-viz {
     display: flex;
     flex-direction: column;
-    flex-wrap: nowrap;
+    flex-wrap: wrap;
+    align-content: flex-start;
     gap: 2px;
-    min-height: 7px;
+    max-height: 142px;
   }
 
   .step {
