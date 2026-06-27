@@ -63,17 +63,18 @@
 
   interface EP { len: number; steps: number; div: number; offset: number; }
   type OpType = 'invert' | 'add' | 'subtract' | 'multiply' | 'chain';
-  interface Op { type: OpType; params: EP; }
+  // For chain ops, prevLen = how many steps of the accumulated pattern to keep
+  // before appending the new pattern (params, whose len = the new length).
+  interface Op { type: OpType; params: EP; prevLen?: number; }
   interface Lane { id: number; euclid: EP; ops: Op[]; sample: AudioBuffer | null; sampleName: string; }
-  interface LaneRt { segIdx: number; stepIdx: number; nextStepTime: number; }
+  interface LaneRt { stepIdx: number; nextStepTime: number; }
 
   interface FlowNode {
     kind: 'src' | OpType;
     params: EP | null;
     pattern: boolean[];
     flatIdx: number | null;   // index into lane.ops, or null for the SRC node
-    segIdx: number;           // which playback segment this node belongs to
-    isSegTerminal: boolean;   // last node of its segment (its pattern is what plays)
+    isFinal: boolean;         // last node — its pattern is what actually plays
   }
 
   function bjorklund(k: number, n: number): boolean[] {
@@ -106,41 +107,46 @@
     });
   }
 
-  function evalPipeline(euclid: EP, ops: Op[]): { pattern: boolean[]; div: number }[] {
-    const result: { pattern: boolean[]; div: number }[] = [];
-    let cur = evalEP(euclid), div = euclid.div;
+  // A chain keeps the first `prevLen` steps of the accumulated pattern, then
+  // appends the new pattern (params). Each step carries its own div (timing).
+  function applyChain(op: Op, pattern: boolean[], divs: number[]): { pattern: boolean[]; divs: number[] } {
+    const np = evalEP(op.params);
+    const x = Math.max(0, Math.min(op.prevLen ?? pattern.length, pattern.length));
+    return {
+      pattern: [...pattern.slice(0, x), ...np],
+      divs: [...divs.slice(0, x), ...np.map(() => op.params.div)],
+    };
+  }
+
+  function evalPipeline(euclid: EP, ops: Op[]): { pattern: boolean[]; divs: number[] } {
+    let pattern = evalEP(euclid);
+    let divs = pattern.map(() => euclid.div);
     for (const op of ops) {
       if (op.type === 'chain') {
-        result.push({ pattern: cur, div });
-        cur = evalEP(op.params);
-        div = op.params.div;
+        ({ pattern, divs } = applyChain(op, pattern, divs));
       } else {
-        cur = applyPatternOp(op, cur);
+        pattern = applyPatternOp(op, pattern);
       }
     }
-    result.push({ pattern: cur, div });
-    return result;
+    return { pattern, divs };
   }
 
   function getFlatNodes(euclid: EP, ops: Op[]): FlowNode[] {
     const nodes: FlowNode[] = [];
-    let cur = evalEP(euclid), seg = 0;
-    nodes.push({ kind: 'src', params: euclid, pattern: cur.slice(), flatIdx: null, segIdx: 0, isSegTerminal: false });
+    let cur = evalEP(euclid);
+    let divs = cur.map(() => euclid.div);
+    nodes.push({ kind: 'src', params: euclid, pattern: cur.slice(), flatIdx: null, isFinal: false });
     for (let i = 0; i < ops.length; i++) {
       const op = ops[i];
       if (op.type === 'chain') {
-        seg++;
-        cur = evalEP(op.params);
-        nodes.push({ kind: 'chain', params: op.params, pattern: cur.slice(), flatIdx: i, segIdx: seg, isSegTerminal: false });
+        ({ pattern: cur, divs } = applyChain(op, cur, divs));
+        nodes.push({ kind: 'chain', params: op.params, pattern: cur.slice(), flatIdx: i, isFinal: false });
       } else {
         cur = applyPatternOp(op, cur);
-        nodes.push({ kind: op.type, params: op.type === 'invert' ? null : op.params, pattern: cur.slice(), flatIdx: i, segIdx: seg, isSegTerminal: false });
+        nodes.push({ kind: op.type, params: op.type === 'invert' ? null : op.params, pattern: cur.slice(), flatIdx: i, isFinal: false });
       }
     }
-    for (let i = 0; i < nodes.length; i++) {
-      const next = nodes[i + 1];
-      nodes[i].isSegTerminal = !next || next.kind === 'chain';
-    }
+    if (nodes.length) nodes[nodes.length - 1].isFinal = true;
     return nodes;
   }
 
@@ -159,7 +165,6 @@
     ? saved.lanes.map(sl => ({ id: sl.id, euclid: sl.euclid, ops: sl.ops, sample: null, sampleName: sl.sampleName }))
     : [defLane()]);
   let currentSteps = $state<Record<number, number>>({});
-  let activeSegIdxs = $state<Record<number, number>>({});
 
   // Auto-save config whenever lanes or bpm change (browser only — $effect doesn't run during SSR)
   $effect(() => {
@@ -168,7 +173,7 @@
       bpm,
       lanes: lanes.map(l => ({
         id: l.id, euclid: { ...l.euclid },
-        ops: l.ops.map(op => ({ type: op.type, params: { ...op.params } })),
+        ops: l.ops.map(op => ({ type: op.type, params: { ...op.params }, prevLen: op.prevLen })),
         sampleName: l.sampleName, hasSample: l.sample !== null
       }))
     };
@@ -199,12 +204,9 @@
     const lookahead = 0.12, now = audioCtx.currentTime;
     for (const lane of lanes) {
       let rt = rts.get(lane.id);
-      if (!rt) { rt = { segIdx: 0, stepIdx: 0, nextStepTime: now }; rts.set(lane.id, rt); }
+      if (!rt) { rt = { stepIdx: 0, nextStepTime: now }; rts.set(lane.id, rt); }
       while (rt.nextStepTime < now + lookahead) {
-        const segs = evalPipeline(lane.euclid, lane.ops);
-        const n = segs.length; if (!n) break;
-        const si = rt.segIdx % n;
-        const { pattern, div } = segs[si];
+        const { pattern, divs } = evalPipeline(lane.euclid, lane.ops);
         if (!pattern.length) break;
         if (rt.stepIdx >= pattern.length) rt.stepIdx = 0;
         const isActive = pattern[rt.stepIdx] ?? false;
@@ -215,17 +217,9 @@
         const stepI = rt.stepIdx, lid = lane.id;
         const delay = Math.max(0, (rt.nextStepTime - now) * 1000 - 10);
         setTimeout(() => { currentSteps[lid] = stepI; }, delay);
+        const div = divs[rt.stepIdx] || 16;
         rt.nextStepTime += 60 / bpm / div;
-        rt.stepIdx++;
-        if (rt.stepIdx >= pattern.length) {
-          rt.stepIdx = 0;
-          const prev = si;
-          rt.segIdx = (si + 1) % n;
-          if (rt.segIdx !== prev) {
-            const ns = rt.segIdx, lid2 = lane.id;
-            setTimeout(() => { activeSegIdxs[lid2] = ns; }, delay);
-          }
-        }
+        rt.stepIdx = (rt.stepIdx + 1) % pattern.length;
       }
     }
     schedulerTimer = setTimeout(schedule, 20);
@@ -236,8 +230,8 @@
     if (audioCtx.state === 'suspended') audioCtx.resume();
     const t0 = audioCtx.currentTime + 0.05;
     rts.clear();
-    for (const lane of lanes) rts.set(lane.id, { segIdx: 0, stepIdx: 0, nextStepTime: t0 });
-    currentSteps = {}; activeSegIdxs = {};
+    for (const lane of lanes) rts.set(lane.id, { stepIdx: 0, nextStepTime: t0 });
+    currentSteps = {};
     playing = true; schedule();
   }
 
@@ -299,18 +293,29 @@
   }
 
   function addOp(lane: Lane, type: OpType) {
-    lane.ops = [...lane.ops, { type, params: defEP() }];
+    const op: Op = { type, params: defEP() };
+    if (type === 'chain') op.prevLen = 16;
+    lane.ops = [...lane.ops, op];
   }
 
   function removeOp(lane: Lane, flatIdx: number) {
     lane.ops = lane.ops.filter((_, i) => i !== flatIdx);
-    const segs = evalPipeline(lane.euclid, lane.ops);
-    const rt = rts.get(lane.id);
-    if (rt && rt.segIdx >= segs.length) { rt.segIdx = 0; rt.stepIdx = 0; activeSegIdxs[lane.id] = 0; }
   }
 
   const OP_LABEL: Record<string, string> = { src: 'SRC', invert: 'INV', add: 'ADD', subtract: 'SUB', multiply: 'MUL', chain: 'CHAIN' };
 </script>
+
+{#snippet prevLenInput(op: Op)}
+  <div class="param">
+    <span class="param-label" title="prev length">P</span>
+    <input type="number" value={op.prevLen ?? 16} min="0" max="64"
+      onpointerdown={(e) => onNumDown(e, () => op.prevLen ?? 16)}
+      onpointermove={(e) => onNumMove(e, (v) => { op.prevLen = v; }, 0, 64)}
+      onpointerup={onNumUp}
+      oninput={(e) => { if (!drag?.moved) op.prevLen = Math.max(0, Math.min(64, +((e.currentTarget as HTMLInputElement).value))); }}
+    />
+  </div>
+{/snippet}
 
 {#snippet epInputs(p: EP)}
   <div class="param">
@@ -371,7 +376,6 @@
 
   <div class="lanes-body">
     {#each lanes as lane (lane.id)}
-      {@const activeSeg = activeSegIdxs[lane.id] ?? 0}
       {@const nodes = getFlatNodes(lane.euclid, lane.ops)}
       <div class="lane">
         <div class="lane-hdr">
@@ -390,7 +394,7 @@
             {#if ni > 0}
               <div class="flow-arrow">▸</div>
             {/if}
-            <div class="flow-stage" class:node-active={activeSeg === node.segIdx}>
+            <div class="flow-stage" class:node-active={node.isFinal && playing}>
               <div class="pipeline-node">
                 <div class="node-hdr">
                   <span class="node-badge badge-{node.kind}">{OP_LABEL[node.kind]}</span>
@@ -399,7 +403,12 @@
                   {/if}
                 </div>
                 {#if node.params}
-                  <div class="ep-col">{@render epInputs(node.params)}</div>
+                  <div class="ep-col">
+                    {#if node.kind === 'chain' && node.flatIdx !== null}
+                      {@render prevLenInput(lane.ops[node.flatIdx])}
+                    {/if}
+                    {@render epInputs(node.params)}
+                  </div>
                 {/if}
               </div>
               <div class="viz-col">
@@ -407,7 +416,7 @@
                 <div class="euc-viz">
                   {#each node.pattern as active, si}
                     <div class="step" class:active class:downbeat={si === 0}
-                      class:current={node.isSegTerminal && activeSeg === node.segIdx && currentSteps[lane.id] === si}
+                      class:current={node.isFinal && currentSteps[lane.id] === si}
                     ></div>
                   {/each}
                 </div>
