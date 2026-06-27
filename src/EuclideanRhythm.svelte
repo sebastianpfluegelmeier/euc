@@ -230,7 +230,7 @@
   .step {
     width: 9px;
     height: 9px;
-    background: #272727;
+    background: #3a3a3a;
     flex-shrink: 0;
   }
 
