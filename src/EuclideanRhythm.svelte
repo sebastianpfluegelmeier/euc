@@ -67,10 +67,13 @@
   interface Lane { id: number; euclid: EP; ops: Op[]; sample: AudioBuffer | null; sampleName: string; }
   interface LaneRt { segIdx: number; stepIdx: number; nextStepTime: number; }
 
-  interface VisGroup {
-    source: EP;
-    chainOpIdx: number | null;
-    groupOps: { op: Op; flatIdx: number }[];
+  interface FlowNode {
+    kind: 'src' | OpType;
+    params: EP | null;
+    pattern: boolean[];
+    flatIdx: number | null;   // index into lane.ops, or null for the SRC node
+    segIdx: number;           // which playback segment this node belongs to
+    isSegTerminal: boolean;   // last node of its segment (its pattern is what plays)
   }
 
   function bjorklund(k: number, n: number): boolean[] {
@@ -119,29 +122,26 @@
     return result;
   }
 
-  function getVisGroups(euclid: EP, ops: Op[]): VisGroup[] {
-    const groups: VisGroup[] = [];
-    let src = euclid, chainOpIdx: number | null = null;
-    let groupOps: { op: Op; flatIdx: number }[] = [];
+  function getFlatNodes(euclid: EP, ops: Op[]): FlowNode[] {
+    const nodes: FlowNode[] = [];
+    let cur = evalEP(euclid), seg = 0;
+    nodes.push({ kind: 'src', params: euclid, pattern: cur.slice(), flatIdx: null, segIdx: 0, isSegTerminal: false });
     for (let i = 0; i < ops.length; i++) {
       const op = ops[i];
       if (op.type === 'chain') {
-        groups.push({ source: src, chainOpIdx, groupOps });
-        src = op.params; chainOpIdx = i; groupOps = [];
+        seg++;
+        cur = evalEP(op.params);
+        nodes.push({ kind: 'chain', params: op.params, pattern: cur.slice(), flatIdx: i, segIdx: seg, isSegTerminal: false });
       } else {
-        groupOps = [...groupOps, { op, flatIdx: i }];
+        cur = applyPatternOp(op, cur);
+        nodes.push({ kind: op.type, params: op.type === 'invert' ? null : op.params, pattern: cur.slice(), flatIdx: i, segIdx: seg, isSegTerminal: false });
       }
     }
-    groups.push({ source: src, chainOpIdx, groupOps });
-    return groups;
-  }
-
-  function getGroupIntermediates(group: VisGroup): boolean[][] {
-    const out: boolean[][] = [];
-    let p = evalEP(group.source);
-    out.push(p.slice());
-    for (const { op } of group.groupOps) { p = applyPatternOp(op, p); out.push(p.slice()); }
-    return out;
+    for (let i = 0; i < nodes.length; i++) {
+      const next = nodes[i + 1];
+      nodes[i].isSegTerminal = !next || next.kind === 'chain';
+    }
+    return nodes;
   }
 
   let _id = 0;
@@ -298,37 +298,18 @@
     }
   }
 
-  function addChain(lane: Lane) {
-    lane.ops = [...lane.ops, { type: 'chain', params: defEP() }];
-  }
-
-  function addPatternOp(lane: Lane, segI: number, type: Exclude<OpType, 'chain'>) {
-    const ops = [...lane.ops];
-    let seen = 0, insertAt = ops.length;
-    for (let i = 0; i < ops.length; i++) {
-      if (ops[i].type === 'chain') { seen++; if (seen > segI) { insertAt = i; break; } }
-    }
-    ops.splice(insertAt, 0, { type, params: defEP() });
-    lane.ops = ops;
+  function addOp(lane: Lane, type: OpType) {
+    lane.ops = [...lane.ops, { type, params: defEP() }];
   }
 
   function removeOp(lane: Lane, flatIdx: number) {
     lane.ops = lane.ops.filter((_, i) => i !== flatIdx);
-  }
-
-  function removeSegment(lane: Lane, chainOpIdx: number) {
-    const ops = [...lane.ops];
-    let end = ops.length;
-    for (let i = chainOpIdx + 1; i < ops.length; i++) {
-      if (ops[i].type === 'chain') { end = i; break; }
-    }
-    lane.ops = [...ops.slice(0, chainOpIdx), ...ops.slice(end)];
     const segs = evalPipeline(lane.euclid, lane.ops);
     const rt = rts.get(lane.id);
     if (rt && rt.segIdx >= segs.length) { rt.segIdx = 0; rt.stepIdx = 0; activeSegIdxs[lane.id] = 0; }
   }
 
-  const OP_LABEL: Record<string, string> = { invert: 'INV', add: 'ADD', subtract: 'SUB', multiply: 'MUL', chain: 'CHAIN' };
+  const OP_LABEL: Record<string, string> = { src: 'SRC', invert: 'INV', add: 'ADD', subtract: 'SUB', multiply: 'MUL', chain: 'CHAIN' };
 </script>
 
 {#snippet epInputs(p: EP)}
@@ -391,7 +372,7 @@
   <div class="lanes-body">
     {#each lanes as lane (lane.id)}
       {@const activeSeg = activeSegIdxs[lane.id] ?? 0}
-      {@const groups = getVisGroups(lane.euclid, lane.ops)}
+      {@const nodes = getFlatNodes(lane.euclid, lane.ops)}
       <div class="lane">
         <div class="lane-hdr">
           <label class="sample-btn">
@@ -404,66 +385,37 @@
           {/if}
         </div>
 
-        <div class="segments-row">
-          {#each groups as group, gi}
-            {#if gi > 0}
-              <div class="chain-arrow">▸</div>
+        <div class="flow-row">
+          {#each nodes as node, ni}
+            {#if ni > 0}
+              <div class="flow-arrow">▸</div>
             {/if}
-            {@const ims = getGroupIntermediates(group)}
-            {@const isCurrent = activeSeg === gi}
-            <div class="segment" class:seg-active={isCurrent}>
-
-              <!-- Source / Chain header node -->
-              <div class="pipeline-node">
-                <div class="node-hdr">
-                  <span class="node-badge" class:badge-src={gi === 0} class:badge-chain={gi > 0}>
-                    {gi === 0 ? 'SRC' : 'CHAIN'}
-                  </span>
-                  {#if gi > 0 && group.chainOpIdx !== null}
-                    <button class="icon-btn" onclick={() => removeSegment(lane, group.chainOpIdx!)}>×</button>
-                  {/if}
-                </div>
-                <div class="ep-col">{@render epInputs(group.source)}</div>
-                <div class="euc-viz">
-                  {#each ims[0] as active, si}
-                    <div class="step" class:active class:downbeat={si === 0}
-                      class:current={isCurrent && group.groupOps.length === 0 && currentSteps[lane.id] === si}
-                    ></div>
-                  {/each}
-                </div>
+            <div class="pipeline-node" class:node-active={activeSeg === node.segIdx}>
+              <div class="node-hdr">
+                <span class="node-badge badge-{node.kind}">{OP_LABEL[node.kind]}</span>
+                {#if node.flatIdx !== null}
+                  <button class="icon-btn" onclick={() => removeOp(lane, node.flatIdx!)}>×</button>
+                {/if}
               </div>
-
-              <!-- Op nodes -->
-              {#each group.groupOps as { op, flatIdx }, opI}
-                <div class="pipe-arrow">▾</div>
-                <div class="pipeline-node">
-                  <div class="node-hdr">
-                    <span class="node-badge badge-{op.type}">{OP_LABEL[op.type]}</span>
-                    <button class="icon-btn" onclick={() => removeOp(lane, flatIdx)}>×</button>
-                  </div>
-                  {#if op.type !== 'invert'}
-                    <div class="ep-col">{@render epInputs(op.params)}</div>
-                  {/if}
-                  <div class="euc-viz">
-                    {#each ims[opI + 1] as active, si}
-                      <div class="step" class:active class:downbeat={si === 0}
-                        class:current={isCurrent && opI === group.groupOps.length - 1 && currentSteps[lane.id] === si}
-                      ></div>
-                    {/each}
-                  </div>
-                </div>
-              {/each}
-
-              <!-- Add pattern op buttons -->
-              <div class="add-ops">
-                {#each (['invert', 'add', 'subtract', 'multiply'] as const) as ot}
-                  <button class="add-op-btn badge-{ot}" onclick={() => addPatternOp(lane, gi, ot)}>+{OP_LABEL[ot]}</button>
+              {#if node.params}
+                <div class="ep-col">{@render epInputs(node.params)}</div>
+              {/if}
+              <div class="euc-viz">
+                {#each node.pattern as active, si}
+                  <div class="step" class:active class:downbeat={si === 0}
+                    class:current={node.isSegTerminal && activeSeg === node.segIdx && currentSteps[lane.id] === si}
+                  ></div>
                 {/each}
               </div>
             </div>
           {/each}
 
-          <button class="add-chain-btn" onclick={() => addChain(lane)}>▸+</button>
+          <div class="flow-arrow">▸</div>
+          <div class="add-ops">
+            {#each (['invert', 'add', 'subtract', 'multiply', 'chain'] as const) as ot}
+              <button class="add-op-btn badge-{ot}" onclick={() => addOp(lane, ot)}>+{OP_LABEL[ot]}</button>
+            {/each}
+          </div>
         </div>
       </div>
     {/each}
@@ -529,8 +481,8 @@
   .sample-btn:hover { border-color: var(--panel-text-dim); color: var(--panel-text); }
   .hidden-file { display: none; }
 
-  /* ── LTR chain row ── */
-  .segments-row {
+  /* ── LTR signal-flow row ── */
+  .flow-row {
     display: flex;
     align-items: flex-start;
     gap: 0;
@@ -538,29 +490,24 @@
     padding-bottom: 4px;
   }
 
-  .chain-arrow {
+  .flow-arrow {
     flex-shrink: 0;
     align-self: flex-start;
-    padding: 6px 4px 0;
+    padding: 8px 4px 0;
     color: var(--panel-text-dim, #8a8a8a);
     font-size: 11px;
   }
 
-  .segment {
-    flex-shrink: 0;
-    min-width: 80px;
-    border-top: 2px solid #333;
-    padding-top: 6px;
-  }
-
-  .segment.seg-active { border-top-color: var(--accent, #ff2050); }
-
-  /* ── Pipeline nodes (vertical layout) ── */
+  /* ── Pipeline nodes (each is a column in the flow) ── */
   .pipeline-node {
+    flex-shrink: 0;
+    min-width: 78px;
     background: var(--surface-bg, #1a1a1a);
     padding: 5px 6px;
-    margin-bottom: 2px;
+    border-top: 2px solid #333;
   }
+
+  .pipeline-node.node-active { border-top-color: var(--accent, #ff2050); }
 
   .node-hdr {
     display: flex;
@@ -593,20 +540,13 @@
     margin-bottom: 5px;
   }
 
-  .pipe-arrow {
-    font-size: 10px;
-    color: var(--panel-text-dim, #8a8a8a);
-    padding-left: 6px;
-    margin: 1px 0;
-  }
-
-  /* ── Viz ── */
+  /* ── Viz (vertical column of step dots) ── */
   .euc-viz {
     display: flex;
+    flex-direction: column;
     flex-wrap: nowrap;
     gap: 2px;
     min-height: 7px;
-    overflow-x: auto;
   }
 
   .step {
@@ -622,10 +562,11 @@
 
   /* ── Add op buttons ── */
   .add-ops {
+    flex-shrink: 0;
     display: flex;
     flex-direction: column;
     gap: 3px;
-    margin-top: 4px;
+    padding-top: 6px;
   }
 
   .add-op-btn {
@@ -641,23 +582,6 @@
   }
 
   .add-op-btn:hover { opacity: 1; }
-
-  .add-chain-btn {
-    flex-shrink: 0;
-    align-self: flex-start;
-    margin-top: 8px;
-    margin-left: 4px;
-    background: transparent;
-    border: 1px dashed #444;
-    color: #ffd740;
-    font-family: var(--term-font, 'JetBrains Mono', monospace);
-    font-size: 11px;
-    cursor: pointer;
-    padding: 2px 6px;
-    opacity: 0.6;
-  }
-
-  .add-chain-btn:hover { opacity: 1; border-style: solid; }
 
   /* ── Shared param/input styles ── */
   .param {
