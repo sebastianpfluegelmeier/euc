@@ -198,6 +198,7 @@
     <button class="play-btn" class:is-playing={playing} onclick={togglePlay}>
       {playing ? '‖' : '▶'}
     </button>
+    <button class="play-btn" onclick={() => location.reload()}>↺</button>
   </div>
 </div>
 
