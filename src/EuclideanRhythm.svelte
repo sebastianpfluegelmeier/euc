@@ -1,12 +1,77 @@
 <script lang="ts">
-  import { onDestroy } from 'svelte';
+  import { onDestroy, onMount } from 'svelte';
+
+  // ── IndexedDB helpers ────────────────────────────────────────────────────────
+  const IDB_NAME = 'euc-samples';
+  const IDB_STORE = 'samples';
+
+  function openIDB(): Promise<IDBDatabase> {
+    return new Promise((res, rej) => {
+      const req = indexedDB.open(IDB_NAME, 1);
+      req.onupgradeneeded = (e) => {
+        const db = (e.target as IDBOpenDBRequest).result;
+        if (!db.objectStoreNames.contains(IDB_STORE)) db.createObjectStore(IDB_STORE);
+      };
+      req.onsuccess = (e) => res((e.target as IDBOpenDBRequest).result);
+      req.onerror = (e) => rej((e.target as IDBOpenDBRequest).error);
+    });
+  }
+
+  async function idbPut(key: number, val: ArrayBuffer): Promise<void> {
+    const db = await openIDB();
+    await new Promise<void>((res, rej) => {
+      const tx = db.transaction(IDB_STORE, 'readwrite');
+      tx.objectStore(IDB_STORE).put(val, key);
+      tx.oncomplete = () => { db.close(); res(); };
+      tx.onerror = (e) => rej((e.target as IDBTransaction).error);
+    });
+  }
+
+  async function idbGet(key: number): Promise<ArrayBuffer | null> {
+    const db = await openIDB();
+    return new Promise((res, rej) => {
+      const tx = db.transaction(IDB_STORE, 'readonly');
+      const req = tx.objectStore(IDB_STORE).get(key);
+      req.onsuccess = (e) => { db.close(); res((e.target as IDBRequest).result ?? null); };
+      req.onerror = (e) => rej((e.target as IDBRequest).error);
+    });
+  }
+
+  async function idbDelete(key: number): Promise<void> {
+    const db = await openIDB();
+    await new Promise<void>((res, rej) => {
+      const tx = db.transaction(IDB_STORE, 'readwrite');
+      tx.objectStore(IDB_STORE).delete(key);
+      tx.oncomplete = () => { db.close(); res(); };
+      tx.onerror = (e) => rej((e.target as IDBTransaction).error);
+    });
+  }
+
+  // ── localStorage helpers ─────────────────────────────────────────────────────
+  const LS_KEY = 'euc-state';
+
+  interface SavedLane {
+    id: number; euclid: EP; ops: Op[]; sampleName: string; hasSample: boolean;
+  }
+  interface SavedState { bpm: number; lanes: SavedLane[]; }
+
+  function readSaved(): SavedState | null {
+    if (typeof localStorage === 'undefined') return null;
+    try { return JSON.parse(localStorage.getItem(LS_KEY) ?? 'null'); }
+    catch { return null; }
+  }
 
   interface EP { len: number; steps: number; div: number; offset: number; }
-  type OpType = 'invert' | 'add' | 'subtract' | 'multiply';
+  type OpType = 'invert' | 'add' | 'subtract' | 'multiply' | 'chain';
   interface Op { type: OpType; params: EP; }
-  interface Segment { euclid: EP; ops: Op[]; reps: number; }
-  interface Lane { id: number; segments: Segment[]; sample: AudioBuffer | null; sampleName: string; }
-  interface LaneRt { segIdx: number; repsDone: number; stepIdx: number; nextStepTime: number; }
+  interface Lane { id: number; euclid: EP; ops: Op[]; sample: AudioBuffer | null; sampleName: string; }
+  interface LaneRt { segIdx: number; stepIdx: number; nextStepTime: number; }
+
+  interface VisGroup {
+    source: EP;
+    chainOpIdx: number | null;
+    groupOps: { op: Op; flatIdx: number }[];
+  }
 
   function bjorklund(k: number, n: number): boolean[] {
     n = n | 0; k = Math.max(0, Math.min(k | 0, n));
@@ -27,7 +92,7 @@
     return rotate(bjorklund(p.steps, p.len), p.offset);
   }
 
-  function applyOp(op: Op, cur: boolean[]): boolean[] {
+  function applyPatternOp(op: Op, cur: boolean[]): boolean[] {
     if (op.type === 'invert') return cur.map(b => !b);
     const b = evalEP(op.params);
     return cur.map((a, i) => {
@@ -38,30 +103,77 @@
     });
   }
 
-  function evalSegment(seg: Segment): boolean[] {
-    let p = evalEP(seg.euclid);
-    for (const op of seg.ops) p = applyOp(op, p);
-    return p;
+  function evalPipeline(euclid: EP, ops: Op[]): { pattern: boolean[]; div: number }[] {
+    const result: { pattern: boolean[]; div: number }[] = [];
+    let cur = evalEP(euclid), div = euclid.div;
+    for (const op of ops) {
+      if (op.type === 'chain') {
+        result.push({ pattern: cur, div });
+        cur = evalEP(op.params);
+        div = op.params.div;
+      } else {
+        cur = applyPatternOp(op, cur);
+      }
+    }
+    result.push({ pattern: cur, div });
+    return result;
   }
 
-  function getIntermediates(seg: Segment): boolean[][] {
+  function getVisGroups(euclid: EP, ops: Op[]): VisGroup[] {
+    const groups: VisGroup[] = [];
+    let src = euclid, chainOpIdx: number | null = null;
+    let groupOps: { op: Op; flatIdx: number }[] = [];
+    for (let i = 0; i < ops.length; i++) {
+      const op = ops[i];
+      if (op.type === 'chain') {
+        groups.push({ source: src, chainOpIdx, groupOps });
+        src = op.params; chainOpIdx = i; groupOps = [];
+      } else {
+        groupOps = [...groupOps, { op, flatIdx: i }];
+      }
+    }
+    groups.push({ source: src, chainOpIdx, groupOps });
+    return groups;
+  }
+
+  function getGroupIntermediates(group: VisGroup): boolean[][] {
     const out: boolean[][] = [];
-    let p = evalEP(seg.euclid);
+    let p = evalEP(group.source);
     out.push(p.slice());
-    for (const op of seg.ops) { p = applyOp(op, p); out.push(p.slice()); }
+    for (const { op } of group.groupOps) { p = applyPatternOp(op, p); out.push(p.slice()); }
     return out;
   }
 
   let _id = 0;
-  const defEP = (): EP => ({ len: 16, steps: 4, div: 4, offset: 0 });
-  const defSeg = (): Segment => ({ euclid: defEP(), ops: [], reps: 1 });
-  const defLane = (): Lane => ({ id: _id++, segments: [defSeg()], sample: null, sampleName: 'CLK' });
+  const defEP = (): EP => ({ len: 16, steps: 4, div: 16, offset: 0 });
+  const defLane = (): Lane => ({ id: _id++, euclid: defEP(), ops: [], sample: null, sampleName: 'CLK' });
 
-  let bpm = $state(120);
+  const saved = readSaved();
+  if (saved?.lanes) {
+    for (const sl of saved.lanes) if (sl.id >= _id) _id = sl.id + 1;
+  }
+
+  let bpm = $state(saved?.bpm ?? 120);
   let playing = $state(false);
-  let lanes = $state<Lane[]>([defLane()]);
+  let lanes = $state<Lane[]>(saved?.lanes
+    ? saved.lanes.map(sl => ({ id: sl.id, euclid: sl.euclid, ops: sl.ops, sample: null, sampleName: sl.sampleName }))
+    : [defLane()]);
   let currentSteps = $state<Record<number, number>>({});
   let activeSegIdxs = $state<Record<number, number>>({});
+
+  // Auto-save config whenever lanes or bpm change (browser only — $effect doesn't run during SSR)
+  $effect(() => {
+    if (typeof localStorage === 'undefined') return;
+    const state: SavedState = {
+      bpm,
+      lanes: lanes.map(l => ({
+        id: l.id, euclid: { ...l.euclid },
+        ops: l.ops.map(op => ({ type: op.type, params: { ...op.params } })),
+        sampleName: l.sampleName, hasSample: l.sample !== null
+      }))
+    };
+    localStorage.setItem(LS_KEY, JSON.stringify(state));
+  });
 
   let audioCtx: AudioContext | null = null;
   let schedulerTimer: ReturnType<typeof setTimeout> | null = null;
@@ -87,14 +199,15 @@
     const lookahead = 0.12, now = audioCtx.currentTime;
     for (const lane of lanes) {
       let rt = rts.get(lane.id);
-      if (!rt) { rt = { segIdx: 0, repsDone: 0, stepIdx: 0, nextStepTime: now }; rts.set(lane.id, rt); }
+      if (!rt) { rt = { segIdx: 0, stepIdx: 0, nextStepTime: now }; rts.set(lane.id, rt); }
       while (rt.nextStepTime < now + lookahead) {
-        const si = Math.min(rt.segIdx, lane.segments.length - 1);
-        const seg = lane.segments[si];
-        if (!seg) break;
-        const pat = evalSegment(seg);
-        if (rt.stepIdx >= pat.length) rt.stepIdx = 0;
-        const isActive = pat[rt.stepIdx] ?? false;
+        const segs = evalPipeline(lane.euclid, lane.ops);
+        const n = segs.length; if (!n) break;
+        const si = rt.segIdx % n;
+        const { pattern, div } = segs[si];
+        if (!pattern.length) break;
+        if (rt.stepIdx >= pattern.length) rt.stepIdx = 0;
+        const isActive = pattern[rt.stepIdx] ?? false;
         if (isActive) {
           if (lane.sample) playBuffer(audioCtx!, lane.sample, rt.nextStepTime);
           else fireClick(audioCtx!, rt.nextStepTime, rt.stepIdx === 0);
@@ -102,19 +215,15 @@
         const stepI = rt.stepIdx, lid = lane.id;
         const delay = Math.max(0, (rt.nextStepTime - now) * 1000 - 10);
         setTimeout(() => { currentSteps[lid] = stepI; }, delay);
-        rt.nextStepTime += 60 / bpm / seg.euclid.div;
+        rt.nextStepTime += 60 / bpm / div;
         rt.stepIdx++;
-        if (rt.stepIdx >= pat.length) {
+        if (rt.stepIdx >= pattern.length) {
           rt.stepIdx = 0;
-          rt.repsDone++;
-          if (rt.repsDone >= seg.reps) {
-            rt.repsDone = 0;
-            const prev = rt.segIdx;
-            rt.segIdx = (rt.segIdx + 1) % Math.max(1, lane.segments.length);
-            if (rt.segIdx !== prev) {
-              const ns = rt.segIdx, lid2 = lane.id;
-              setTimeout(() => { activeSegIdxs[lid2] = ns; }, delay);
-            }
+          const prev = si;
+          rt.segIdx = (si + 1) % n;
+          if (rt.segIdx !== prev) {
+            const ns = rt.segIdx, lid2 = lane.id;
+            setTimeout(() => { activeSegIdxs[lid2] = ns; }, delay);
           }
         }
       }
@@ -127,7 +236,7 @@
     if (audioCtx.state === 'suspended') audioCtx.resume();
     const t0 = audioCtx.currentTime + 0.05;
     rts.clear();
-    for (const lane of lanes) rts.set(lane.id, { segIdx: 0, repsDone: 0, stepIdx: 0, nextStepTime: t0 });
+    for (const lane of lanes) rts.set(lane.id, { segIdx: 0, stepIdx: 0, nextStepTime: t0 });
     currentSteps = {}; activeSegIdxs = {};
     playing = true; schedule();
   }
@@ -141,9 +250,28 @@
   function togglePlay() { if (playing) stop(); else start(); }
   onDestroy(() => { if (schedulerTimer !== null) clearTimeout(schedulerTimer); audioCtx?.close(); });
 
+  onMount(async () => {
+    if (!saved?.lanes) return;
+    for (const sl of saved.lanes) {
+      if (!sl.hasSample) continue;
+      try {
+        const buf = await idbGet(sl.id);
+        if (!buf) continue;
+        if (!audioCtx) audioCtx = new AudioContext();
+        const decoded = await audioCtx.decodeAudioData(buf);
+        const lane = lanes.find(l => l.id === sl.id);
+        if (lane) lane.sample = decoded;
+      } catch (e) {
+        console.warn('Failed to restore sample for lane', sl.id, e);
+      }
+    }
+  });
+
   async function loadSample(lane: Lane, file: File) {
     if (!audioCtx) audioCtx = new AudioContext();
     const raw = await file.arrayBuffer();
+    // Save a copy before decodeAudioData may detach the buffer
+    idbPut(lane.id, raw.slice(0)).catch(e => console.warn('IDB save failed', e));
     lane.sample = await audioCtx.decodeAudioData(raw);
     lane.sampleName = file.name.replace(/\.[^.]+$/, '').slice(0, 8).toUpperCase();
   }
@@ -163,28 +291,44 @@
   function onNumUp() { drag = null; }
 
   function addLane() { lanes = [...lanes, defLane()]; }
-  function removeLane(id: number) { if (lanes.length > 1) lanes = lanes.filter(l => l.id !== id); }
-  function addSegment(lane: Lane) {
-    const last = lane.segments[lane.segments.length - 1];
-    lane.segments = [...lane.segments, { euclid: { ...last.euclid }, ops: [], reps: 1 }];
-  }
-  function removeSegment(lane: Lane, i: number) {
-    if (lane.segments.length <= 1) return;
-    lane.segments = lane.segments.filter((_, j) => j !== i);
-    const rt = rts.get(lane.id);
-    if (rt && rt.segIdx >= lane.segments.length) {
-      rt.segIdx = 0; rt.repsDone = 0; rt.stepIdx = 0;
-      activeSegIdxs[lane.id] = 0;
+  function removeLane(id: number) {
+    if (lanes.length > 1) {
+      lanes = lanes.filter(l => l.id !== id);
+      idbDelete(id).catch(() => {});
     }
   }
-  function addOp(seg: Segment, type: OpType) {
-    seg.ops = [...seg.ops, { type, params: defEP() }];
-  }
-  function removeOp(seg: Segment, i: number) {
-    seg.ops = seg.ops.filter((_, j) => j !== i);
+
+  function addChain(lane: Lane) {
+    lane.ops = [...lane.ops, { type: 'chain', params: defEP() }];
   }
 
-  const OP_LABEL: Record<string, string> = { invert: 'INV', add: 'ADD', subtract: 'SUB', multiply: 'MUL' };
+  function addPatternOp(lane: Lane, segI: number, type: Exclude<OpType, 'chain'>) {
+    const ops = [...lane.ops];
+    let seen = 0, insertAt = ops.length;
+    for (let i = 0; i < ops.length; i++) {
+      if (ops[i].type === 'chain') { seen++; if (seen > segI) { insertAt = i; break; } }
+    }
+    ops.splice(insertAt, 0, { type, params: defEP() });
+    lane.ops = ops;
+  }
+
+  function removeOp(lane: Lane, flatIdx: number) {
+    lane.ops = lane.ops.filter((_, i) => i !== flatIdx);
+  }
+
+  function removeSegment(lane: Lane, chainOpIdx: number) {
+    const ops = [...lane.ops];
+    let end = ops.length;
+    for (let i = chainOpIdx + 1; i < ops.length; i++) {
+      if (ops[i].type === 'chain') { end = i; break; }
+    }
+    lane.ops = [...ops.slice(0, chainOpIdx), ...ops.slice(end)];
+    const segs = evalPipeline(lane.euclid, lane.ops);
+    const rt = rts.get(lane.id);
+    if (rt && rt.segIdx >= segs.length) { rt.segIdx = 0; rt.stepIdx = 0; activeSegIdxs[lane.id] = 0; }
+  }
+
+  const OP_LABEL: Record<string, string> = { invert: 'INV', add: 'ADD', subtract: 'SUB', multiply: 'MUL', chain: 'CHAIN' };
 </script>
 
 {#snippet epInputs(p: EP)}
@@ -247,6 +391,7 @@
   <div class="lanes-body">
     {#each lanes as lane (lane.id)}
       {@const activeSeg = activeSegIdxs[lane.id] ?? 0}
+      {@const groups = getVisGroups(lane.euclid, lane.ops)}
       <div class="lane">
         <div class="lane-hdr">
           <label class="sample-btn">
@@ -259,73 +404,67 @@
           {/if}
         </div>
 
-        {#each lane.segments as seg, segI}
-          {@const ims = getIntermediates(seg)}
-          {@const isCurrent = activeSeg === segI}
-          <div class="segment" class:seg-active={isCurrent}>
+        <div class="segments-row">
+          {#each groups as group, gi}
+            {#if gi > 0}
+              <div class="chain-arrow">▸</div>
+            {/if}
+            {@const ims = getGroupIntermediates(group)}
+            {@const isCurrent = activeSeg === gi}
+            <div class="segment" class:seg-active={isCurrent}>
 
-            <!-- SOURCE node -->
-            <div class="pipeline-node">
-              <div class="node-row">
-                <span class="node-badge badge-src">SRC</span>
-                <div class="ep-row">{@render epInputs(seg.euclid)}</div>
-                <div class="param">
-                  <span class="param-label">R</span>
-                  <input type="number" value={seg.reps} min="1" max="64"
-                    onpointerdown={(e) => onNumDown(e, () => seg.reps)}
-                    onpointermove={(e) => onNumMove(e, (v) => { seg.reps = v; }, 1, 64)}
-                    onpointerup={onNumUp}
-                    oninput={(e) => { if (!drag?.moved) seg.reps = Math.max(1, Math.min(64, +((e.currentTarget as HTMLInputElement).value) || 1)); }}
-                  />
-                </div>
-                {#if lane.segments.length > 1}
-                  <button class="icon-btn" onclick={() => removeSegment(lane, segI)}>×</button>
-                {/if}
-              </div>
-              <div class="euc-viz">
-                {#each ims[0] as active, si}
-                  <div class="step" class:active class:downbeat={si === 0}
-                    class:current={isCurrent && seg.ops.length === 0 && currentSteps[lane.id] === si}
-                  ></div>
-                {/each}
-              </div>
-            </div>
-
-            <!-- OP nodes -->
-            {#each seg.ops as op, opI}
-              <div class="pipe-arrow">▾</div>
+              <!-- Source / Chain header node -->
               <div class="pipeline-node">
-                <div class="node-row">
-                  <span class="node-badge badge-{op.type}">{OP_LABEL[op.type]}</span>
-                  {#if op.type !== 'invert'}
-                    <div class="ep-row">{@render epInputs(op.params)}</div>
+                <div class="node-hdr">
+                  <span class="node-badge" class:badge-src={gi === 0} class:badge-chain={gi > 0}>
+                    {gi === 0 ? 'SRC' : 'CHAIN'}
+                  </span>
+                  {#if gi > 0 && group.chainOpIdx !== null}
+                    <button class="icon-btn" onclick={() => removeSegment(lane, group.chainOpIdx!)}>×</button>
                   {/if}
-                  <button class="icon-btn" onclick={() => removeOp(seg, opI)}>×</button>
                 </div>
+                <div class="ep-col">{@render epInputs(group.source)}</div>
                 <div class="euc-viz">
-                  {#each ims[opI + 1] as active, si}
+                  {#each ims[0] as active, si}
                     <div class="step" class:active class:downbeat={si === 0}
-                      class:current={isCurrent && opI === seg.ops.length - 1 && currentSteps[lane.id] === si}
+                      class:current={isCurrent && group.groupOps.length === 0 && currentSteps[lane.id] === si}
                     ></div>
                   {/each}
                 </div>
               </div>
-            {/each}
 
-            <!-- Add op buttons -->
-            <div class="add-ops">
-              {#each (['invert', 'add', 'subtract', 'multiply'] as const) as ot}
-                <button class="add-op-btn badge-{ot}" onclick={() => addOp(seg, ot)}>+{OP_LABEL[ot]}</button>
+              <!-- Op nodes -->
+              {#each group.groupOps as { op, flatIdx }, opI}
+                <div class="pipe-arrow">▾</div>
+                <div class="pipeline-node">
+                  <div class="node-hdr">
+                    <span class="node-badge badge-{op.type}">{OP_LABEL[op.type]}</span>
+                    <button class="icon-btn" onclick={() => removeOp(lane, flatIdx)}>×</button>
+                  </div>
+                  {#if op.type !== 'invert'}
+                    <div class="ep-col">{@render epInputs(op.params)}</div>
+                  {/if}
+                  <div class="euc-viz">
+                    {#each ims[opI + 1] as active, si}
+                      <div class="step" class:active class:downbeat={si === 0}
+                        class:current={isCurrent && opI === group.groupOps.length - 1 && currentSteps[lane.id] === si}
+                      ></div>
+                    {/each}
+                  </div>
+                </div>
               {/each}
+
+              <!-- Add pattern op buttons -->
+              <div class="add-ops">
+                {#each (['invert', 'add', 'subtract', 'multiply'] as const) as ot}
+                  <button class="add-op-btn badge-{ot}" onclick={() => addPatternOp(lane, gi, ot)}>+{OP_LABEL[ot]}</button>
+                {/each}
+              </div>
             </div>
-          </div>
+          {/each}
 
-          {#if segI < lane.segments.length - 1}
-            <div class="chain-connector">▾ CHAIN</div>
-          {/if}
-        {/each}
-
-        <button class="add-btn" onclick={() => addSegment(lane)}>+ CHAIN</button>
+          <button class="add-chain-btn" onclick={() => addChain(lane)}>▸+</button>
+        </div>
       </div>
     {/each}
 
@@ -390,59 +529,78 @@
   .sample-btn:hover { border-color: var(--panel-text-dim); color: var(--panel-text); }
   .hidden-file { display: none; }
 
-  .segment {
-    border-left: 2px solid #333;
-    padding-left: 6px;
-    margin-bottom: 4px;
+  /* ── LTR chain row ── */
+  .segments-row {
+    display: flex;
+    align-items: flex-start;
+    gap: 0;
+    overflow-x: auto;
+    padding-bottom: 4px;
   }
 
-  .segment.seg-active { border-left-color: var(--accent, #ff2050); }
+  .chain-arrow {
+    flex-shrink: 0;
+    align-self: flex-start;
+    padding: 6px 4px 0;
+    color: var(--panel-text-dim, #8a8a8a);
+    font-size: 11px;
+  }
 
+  .segment {
+    flex-shrink: 0;
+    min-width: 80px;
+    border-top: 2px solid #333;
+    padding-top: 6px;
+  }
+
+  .segment.seg-active { border-top-color: var(--accent, #ff2050); }
+
+  /* ── Pipeline nodes (vertical layout) ── */
   .pipeline-node {
     background: var(--surface-bg, #1a1a1a);
-    padding: 6px;
+    padding: 5px 6px;
     margin-bottom: 2px;
   }
 
-  .node-row {
+  .node-hdr {
     display: flex;
-    align-items: flex-end;
-    gap: 6px;
-    margin-bottom: 5px;
-    flex-wrap: wrap;
-  }
-
-  .ep-row {
-    display: flex;
-    gap: 4px;
-    align-items: flex-end;
-    flex-wrap: wrap;
+    align-items: center;
+    justify-content: space-between;
+    margin-bottom: 3px;
   }
 
   .node-badge {
     font-size: 9px;
     font-weight: 500;
     letter-spacing: 0.08em;
-    padding: 2px 5px;
+    padding: 1px 4px;
     border: 1px solid currentColor;
     white-space: nowrap;
-    align-self: flex-end;
-    margin-bottom: 1px;
   }
 
-  .badge-src      { color: var(--panel-text-dim, #8a8a8a); }
+  .badge-src    { color: var(--panel-text-dim, #8a8a8a); }
+  .badge-chain  { color: #ffd740; }
   .badge-invert   { color: #b085f5; }
   .badge-add      { color: #69f0ae; }
   .badge-subtract { color: #ff7043; }
   .badge-multiply { color: #40c4ff; }
 
+  /* params stacked vertically */
+  .ep-col {
+    display: flex;
+    flex-direction: column;
+    gap: 3px;
+    margin-bottom: 5px;
+  }
+
   .pipe-arrow {
     font-size: 10px;
     color: var(--panel-text-dim, #8a8a8a);
-    padding-left: 8px;
+    padding-left: 6px;
     margin: 1px 0;
   }
 
+  /* ── Viz ── */
   .euc-viz {
     display: flex;
     flex-wrap: wrap;
@@ -461,11 +619,12 @@
   .step.current { outline: 1px solid var(--accent, #ff2050); outline-offset: -1px; }
   .step.current.active, .step.current.downbeat { background: var(--accent, #ff2050); outline: none; }
 
+  /* ── Add op buttons ── */
   .add-ops {
     display: flex;
-    gap: 4px;
-    margin-top: 5px;
-    flex-wrap: wrap;
+    flex-direction: column;
+    gap: 3px;
+    margin-top: 4px;
   }
 
   .add-op-btn {
@@ -475,19 +634,31 @@
     font-size: 9px;
     letter-spacing: 0.06em;
     cursor: pointer;
-    padding: 2px 6px;
-    opacity: 0.55;
+    padding: 2px 4px;
+    opacity: 0.5;
+    text-align: left;
   }
 
   .add-op-btn:hover { opacity: 1; }
 
-  .chain-connector {
-    font-size: 9px;
-    letter-spacing: 0.1em;
-    color: var(--panel-text-dim, #8a8a8a);
-    padding: 3px 0 3px 8px;
+  .add-chain-btn {
+    flex-shrink: 0;
+    align-self: flex-start;
+    margin-top: 8px;
+    margin-left: 4px;
+    background: transparent;
+    border: 1px dashed #444;
+    color: #ffd740;
+    font-family: var(--term-font, 'JetBrains Mono', monospace);
+    font-size: 11px;
+    cursor: pointer;
+    padding: 2px 6px;
+    opacity: 0.6;
   }
 
+  .add-chain-btn:hover { opacity: 1; border-style: solid; }
+
+  /* ── Shared param/input styles ── */
   .param {
     display: flex;
     flex-direction: column;
@@ -502,7 +673,7 @@
   }
 
   input[type='number'] {
-    width: 36px;
+    width: 44px;
     background: var(--surface-bg, #1a1a1a);
     border: 1px solid #333;
     color: var(--panel-text, #e8e8e8);
@@ -541,11 +712,10 @@
     background: transparent;
     border: none;
     color: var(--panel-text-dim, #8a8a8a);
-    font-size: 16px;
+    font-size: 14px;
     cursor: pointer;
-    padding: 0 2px;
+    padding: 0 1px;
     line-height: 1;
-    align-self: flex-end;
   }
 
   .icon-btn:hover { color: var(--panel-text); }
