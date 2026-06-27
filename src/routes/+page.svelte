@@ -8,6 +8,6 @@
 
 <style>
   main {
-    padding: 24px;
+    padding: 0;
   }
 </style>

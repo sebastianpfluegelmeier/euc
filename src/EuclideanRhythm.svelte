@@ -184,6 +184,7 @@
     </div>
   </div>
 
+  <div class="lanes-body">
   {#each lanes as lane (lane.id)}
     {@const activeCi = activeChainIdxs[lane.id] ?? 0}
     <div class="lane">
@@ -211,6 +212,7 @@
               ></div>
             {/each}
           </div>
+          <div class="cs-params-box">
           <div class="cs-params">
             <div class="param">
               <span class="param-label">L</span>
@@ -261,6 +263,7 @@
               <button class="icon-btn remove-cs" onclick={() => removeChainStep(lane, ci)}>×</button>
             {/if}
           </div>
+          </div>
         </div>
       {/each}
 
@@ -269,6 +272,7 @@
   {/each}
 
   <button class="add-btn add-lane-btn" onclick={addLane}>+ LANE</button>
+  </div>
 </div>
 
 <style>
@@ -280,10 +284,20 @@
   }
 
   .top-bar {
+    position: sticky;
+    top: 0;
+    z-index: 10;
     display: flex;
     justify-content: space-between;
-    align-items: flex-end;
-    margin-bottom: 12px;
+    align-items: center;
+    padding: 10px 16px;
+    background: var(--surface-raised, #262626);
+    border-bottom: 1px solid #333;
+    margin-bottom: 0;
+  }
+
+  .lanes-body {
+    padding: 12px;
   }
 
   .title {
@@ -294,7 +308,7 @@
 
   .transport {
     display: flex;
-    align-items: flex-end;
+    align-items: center;
     gap: 8px;
   }
 
@@ -356,6 +370,12 @@
   .step.downbeat { background: var(--panel-text, #e8e8e8); }
   .step.current { outline: 1px solid var(--accent, #ff2050); outline-offset: -1px; }
   .step.current.active, .step.current.downbeat { background: var(--accent, #ff2050); outline: none; }
+
+  .cs-params-box {
+    background: var(--surface-bg, #1a1a1a);
+    padding: 6px;
+    margin-top: 2px;
+  }
 
   .cs-params {
     display: flex;
