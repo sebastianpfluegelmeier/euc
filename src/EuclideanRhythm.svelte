@@ -579,14 +579,13 @@
     margin-bottom: 5px;
   }
 
-  /* ── Viz: vertical dots, max 16 tall, then wraps into the next column ── */
+  /* ── Viz: vertical dots, max 16 tall, then flows into the next column ── */
   .euc-viz {
-    display: flex;
-    flex-direction: column;
-    flex-wrap: wrap;
-    align-content: flex-start;
+    display: grid;
+    grid-auto-flow: column;
+    grid-template-rows: repeat(16, 7px);
+    grid-auto-columns: 7px;
     gap: 2px;
-    max-height: 142px;
   }
 
   .step {
