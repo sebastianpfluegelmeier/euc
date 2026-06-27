@@ -662,8 +662,9 @@
   /* ── Shared param/input styles ── */
   .param {
     display: flex;
-    flex-direction: column;
-    gap: 2px;
+    flex-direction: row;
+    align-items: center;
+    gap: 4px;
   }
 
   .param-label {
