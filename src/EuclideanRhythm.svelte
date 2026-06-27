@@ -390,22 +390,27 @@
             {#if ni > 0}
               <div class="flow-arrow">▸</div>
             {/if}
-            <div class="pipeline-node" class:node-active={activeSeg === node.segIdx}>
-              <div class="node-hdr">
-                <span class="node-badge badge-{node.kind}">{OP_LABEL[node.kind]}</span>
-                {#if node.flatIdx !== null}
-                  <button class="icon-btn" onclick={() => removeOp(lane, node.flatIdx!)}>×</button>
+            <div class="flow-stage" class:node-active={activeSeg === node.segIdx}>
+              <div class="pipeline-node">
+                <div class="node-hdr">
+                  <span class="node-badge badge-{node.kind}">{OP_LABEL[node.kind]}</span>
+                  {#if node.flatIdx !== null}
+                    <button class="icon-btn" onclick={() => removeOp(lane, node.flatIdx!)}>×</button>
+                  {/if}
+                </div>
+                {#if node.params}
+                  <div class="ep-col">{@render epInputs(node.params)}</div>
                 {/if}
               </div>
-              {#if node.params}
-                <div class="ep-col">{@render epInputs(node.params)}</div>
-              {/if}
-              <div class="euc-viz">
-                {#each node.pattern as active, si}
-                  <div class="step" class:active class:downbeat={si === 0}
-                    class:current={node.isSegTerminal && activeSeg === node.segIdx && currentSteps[lane.id] === si}
-                  ></div>
-                {/each}
+              <div class="viz-col">
+                <span class="viz-eq">=</span>
+                <div class="euc-viz">
+                  {#each node.pattern as active, si}
+                    <div class="step" class:active class:downbeat={si === 0}
+                      class:current={node.isSegTerminal && activeSeg === node.segIdx && currentSteps[lane.id] === si}
+                    ></div>
+                  {/each}
+                </div>
               </div>
             </div>
           {/each}
@@ -498,16 +503,39 @@
     font-size: 11px;
   }
 
-  /* ── Pipeline nodes (each is a column in the flow) ── */
-  .pipeline-node {
+  /* ── A stage = one processor block followed by its result viz ── */
+  .flow-stage {
     flex-shrink: 0;
-    min-width: 78px;
-    background: var(--surface-bg, #1a1a1a);
-    padding: 5px 6px;
+    display: flex;
+    align-items: flex-start;
     border-top: 2px solid #333;
   }
 
-  .pipeline-node.node-active { border-top-color: var(--accent, #ff2050); }
+  .flow-stage.node-active { border-top-color: var(--accent, #ff2050); }
+
+  .pipeline-node {
+    flex-shrink: 0;
+    min-width: 72px;
+    background: var(--surface-bg, #1a1a1a);
+    padding: 5px 6px;
+  }
+
+  /* result viz shown after each processing block */
+  .viz-col {
+    flex-shrink: 0;
+    display: flex;
+    align-items: flex-start;
+    gap: 4px;
+    padding: 5px 6px;
+    background: #141414;
+  }
+
+  .viz-eq {
+    font-size: 11px;
+    color: var(--panel-text-dim, #8a8a8a);
+    line-height: 7px;
+    padding-top: 1px;
+  }
 
   .node-hdr {
     display: flex;
