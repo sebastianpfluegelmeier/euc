@@ -603,9 +603,10 @@
   /* ── Viz ── */
   .euc-viz {
     display: flex;
-    flex-wrap: wrap;
+    flex-wrap: nowrap;
     gap: 2px;
     min-height: 7px;
+    overflow-x: auto;
   }
 
   .step {
